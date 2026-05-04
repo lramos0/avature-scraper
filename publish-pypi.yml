@@ -1,0 +1,116 @@
+name: Publish pooled-job-scraper to PyPI
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      project_name: ${{ steps.meta.outputs.project_name }}
+      project_version: ${{ steps.meta.outputs.project_version }}
+      version_exists: ${{ steps.check.outputs.version_exists }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Read package metadata
+        id: meta
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          pyproject = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          data = tomllib.loads(pyproject)
+          name = data["project"]["name"]
+          version = data["project"]["version"]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"project_name={name}\n")
+              fh.write(f"project_version={version}\n")
+
+          print(f"Detected package: {name}=={version}")
+          PY
+
+      - name: Check whether version already exists on PyPI
+        id: check
+        env:
+          PROJECT_NAME: ${{ steps.meta.outputs.project_name }}
+          PROJECT_VERSION: ${{ steps.meta.outputs.project_version }}
+        run: |
+          python - <<'PY'
+          import os
+          import urllib.error
+          import urllib.request
+
+          name = os.environ["PROJECT_NAME"]
+          version = os.environ["PROJECT_VERSION"]
+          url = f"https://pypi.org/pypi/{name}/{version}/json"
+          exists = "false"
+
+          try:
+              with urllib.request.urlopen(url, timeout=15) as response:
+                  if 200 <= response.status < 300:
+                      exists = "true"
+          except urllib.error.HTTPError as err:
+              if err.code != 404:
+                  raise
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"version_exists={exists}\n")
+
+          print(f"version_exists={exists}")
+          PY
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  publish:
+    needs: build
+    if: needs.build.outputs.version_exists != 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/${{ needs.build.outputs.project_name }}
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  skip-if-version-exists:
+    needs: build
+    if: needs.build.outputs.version_exists == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip publish (version already on PyPI)
+        run: |
+          echo "Skipping publish: ${{ needs.build.outputs.project_name }} ${{ needs.build.outputs.project_version }} already exists on PyPI."

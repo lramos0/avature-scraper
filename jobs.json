@@ -1,0 +1,65 @@
+{
+  "target_url": "https://xerox.avature.net/en_US/careers",
+  "output_fields": [
+    "id",
+    "title",
+    "description",
+    "location",
+    "url",
+    "job_title",
+    "company_name",
+    "job_location",
+    "job_seniority_level",
+    "job_employment_type",
+    "job_industries",
+    "job_summary",
+    "job_base_pay_range",
+    "job_posted_date",
+    "competitiveness_score",
+    "skills",
+    "certifications",
+    "industries",
+    "achievements",
+    "apply_link",
+    "country_code",
+    "ingest_utc_date",
+    "ingest_utc_hour",
+    "source_business_url",
+    "education_requirements"
+  ],
+  "robots": [
+    {
+      "url": "https://xerox.avature.net/en_US/careers",
+      "robots_url": "https://xerox.avature.net/robots.txt",
+      "allowed": false,
+      "has_robots_txt": true,
+      "reason": "robots.txt disallows this URL for the selected user agent.",
+      "user_agent": "aventure-scraper/0.2.4 (+https://example.com/contact)"
+    }
+  ],
+  "landing_page": {
+    "url": "https://xerox.avature.net/en_US/careers",
+    "method": "requests",
+    "ok": true,
+    "status_code": 200,
+    "content": "",
+    "content_type": "text/html;charset=UTF-8",
+    "error": null
+  },
+  "discovered_job_urls": [
+    "https://xerox.avature.net/_linkedinApiv2?portalUrl=https%3A%2F%2Fxerox.avature.net%2F&action=INIT_SHARE&shareUrl=https%3A%2F%2Fxerox.avature.net%2Fen_US%2Fcareers%2FJobDetail%2FAccount-Manager-National-Sales%2F50514",
+    "https://xerox.avature.net/_linkedinApiv2?portalUrl=https%3A%2F%2Fxerox.avature.net%2F&action=INIT_SHARE&shareUrl=https%3A%2F%2Fxerox.avature.net%2Fen_US%2Fcareers%2FJobDetail%2FAccount-Operations-Floater-Hag-t-a-GU%2F47892",
+    "https://xerox.avature.net/_linkedinApiv2?portalUrl=https%3A%2F%2Fxerox.avature.net%2F&action=INIT_SHARE&shareUrl=https%3A%2F%2Fxerox.avature.net%2Fen_US%2Fcareers%2FJobDetail%2FAccounting-Analyst%2F49507",
+    "https://xerox.avature.net/_linkedinApiv2?portalUrl=https%3A%2F%2Fxerox.avature.net%2F&action=INIT_SHARE&shareUrl=https%3A%2F%2Fxerox.avature.net%2Fen_US%2Fcareers%2FJobDetail%2FAccounting-Manager%2F49504",
+    "https://xerox.avature.net/_linkedinApiv2?portalUrl=https%3A%2F%2Fxerox.avature.net%2F&action=INIT_SHARE&shareUrl=https%3A%2F%2Fxerox.avature.net%2Fen_US%2Fcareers%2FJobDetail%2FAccounting-Reporting-Specialist%2F50262",
+    "https://xerox.avature.net/en_US/careers/JobDetail/Account-Manager-National-Sales/50514",
+    "https://xerox.avature.net/en_US/careers/JobDetail/Account-Operations-Floater-Hag-t-a-GU/47892",
+    "https://xerox.avature.net/en_US/careers/JobDetail/Accounting-Analyst/49507",
+    "https://xerox.avature.net/en_US/careers/JobDetail/Accounting-Manager/49504",
+    "https://xerox.avature.net/en_US/careers/JobDetail/Accounting-Reporting-Specialist/50262"
+  ],
+  "jobs": [],
+  "warnings": [
+    "Operator explicitly acknowledged legal responsibility before fetching disallowed URL: https://xerox.avature.net/en_US/careers"
+  ]
+}
