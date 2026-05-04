@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avature-scraper"
-version = "0.2.4"
+version = "0.0.1"
 description = "Ethical Avature career-site scraper with robots.txt checks, output caching, and progressive fetch fallbacks."
 readme = "README.md"
 requires-python = ">=3.10"
