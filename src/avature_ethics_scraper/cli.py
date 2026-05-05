@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -17,6 +19,7 @@ from .console import (
     show_summary,
 )
 from .csv_jobpool import export_csv_and_maybe_upload
+from .fetchers import apply_wslg_display_if_needed
 from .git_identity import resolve_cache_user_key
 from .output_spec import OutputSpec
 from .scraper import EthicalAvatureScraper, ScrapeSettings
@@ -69,9 +72,51 @@ def main(
         bool,
         typer.Option("--verbose", help="Show full robots.txt panels, cache writes, and detailed fetch diagnostics."),
     ] = False,
+    browser_path: Annotated[
+        str | None,
+        typer.Option(
+            "--browser-path",
+            help="Path to Chrome/Chromium executable for playwrong (required when auto-detection fails).",
+        ),
+    ] = None,
+    browser_engine: Annotated[
+        str,
+        typer.Option(
+            "--browser-engine",
+            help="Browser engine for playwrong: chromium or firefox.",
+            case_sensitive=False,
+        ),
+    ] = "chromium",
     angry: Annotated[
         bool,
-        typer.Option("--angry", help="Easter egg: render the progress cat in red."),
+        typer.Option("--angry", help="Easter egg: red cat; also bypasses robots disallow without prompting (legacy)."),
+    ] = False,
+    allow_disallowed_robots: Annotated[
+        bool,
+        typer.Option(
+            "--allow-disallowed-robots",
+            help=(
+                "If robots.txt disallows the URL, fetch anyway (no interactive prompt). "
+                "Adds a warning to the report. Prefer this over --angry for batch/CI; normal HTTP/headless fallbacks still apply."
+            ),
+        ),
+    ] = False,
+    headful_for_each_job: Annotated[
+        bool,
+        typer.Option(
+            "--headful-for-each-job",
+            help=(
+                "Always start job-detail fetches with headful Playwright. Default skips headful after the first job "
+                "succeeds via HTTP (faster bulk runs; then you usually will not see a browser window)."
+            ),
+        ),
+    ] = False,
+    discover_only: Annotated[
+        bool,
+        typer.Option(
+            "--discover-only",
+            help="Only discover and save job URLs from landing pages; skip all job-detail fetches.",
+        ),
     ] = False,
     skills: Annotated[
         bool,
@@ -105,7 +150,11 @@ def main(
         bool,
         typer.Option(
             "--all",
-            help="Shorthand for all optional JobDataPool-style columns (skills, ingestion, education, company) plus full export field list.",
+            help=(
+                "Shorthand for all optional JobDataPool-style columns (skills, ingestion, education, company) plus full export field list. "
+                "Best-effort: rich pages with ld+json or clear labels fill cleanly; sparse pages rely on inference, headful fetch, "
+                "and may set needs_manual_review or skip rows when a field cannot be satisfied."
+            ),
         ),
     ] = False,
     csv_out: Annotated[
@@ -130,7 +179,24 @@ def main(
         ),
     ] = None,
 ) -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+            sys.stderr.reconfigure(line_buffering=True)
+        except (OSError, ValueError):
+            pass
+    apply_wslg_display_if_needed()
+    # Bypass TextIO buffering (notably Windows + subprocess log files).
+    try:
+        os.write(
+            1,
+            f"avature-scraper: start {target_url}\n".encode("utf-8", errors="replace"),
+        )
+    except OSError:
+        print(f"avature-scraper: start {target_url}", flush=True)
     banner()
+    sys.stdout.flush()
+    sys.stderr.flush()
 
     cache = ReportCache(output)
     cached_report = None
@@ -172,6 +238,11 @@ def main(
         same_host_only=not allow_external_hosts,
         verbose=verbose,
         angry=angry,
+        browser_path=browser_path,
+        browser_engine=browser_engine.strip().lower(),
+        allow_disallowed_robots=allow_disallowed_robots,
+        headful_for_each_job=headful_for_each_job,
+        discover_only=discover_only,
         output_spec=output_spec,
     )
     scraper = EthicalAvatureScraper(settings)

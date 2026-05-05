@@ -17,7 +17,13 @@ from .console import (
     show_cache_write,
     start_cat_progress,
 )
-from .extract import apply_headful_inference, discover_job_urls, extract_job_record, validate_job_page
+from .extract import (
+    apply_headful_inference,
+    discover_job_urls,
+    extract_job_record,
+    is_linkedin_hosted_careers_landing,
+    validate_job_page,
+)
 from .fetchers import FetchSettings, PlaywrightFetcher, RequestsFetcher
 from .models import FetchResult, JobSummary, ScrapeReport
 from .output_spec import (
@@ -29,7 +35,7 @@ from .output_spec import (
 )
 from .cache import ReportCache
 from .robots import RobotsPolicy
-from .urls import normalize_url
+from .urls import career_landing_url_candidates, normalize_url
 
 
 @dataclass(frozen=True)
@@ -42,6 +48,13 @@ class ScrapeSettings:
     same_host_only: bool = True
     verbose: bool = False
     angry: bool = False
+    browser_path: str | None = None
+    browser_engine: str = "chromium"
+    allow_disallowed_robots: bool = False
+    # If True, never skip headful Playwright for job URLs after plain HTTP succeeds once (default: skip for speed).
+    headful_for_each_job: bool = False
+    # If True, stop after landing-page discovery and do not fetch individual job details.
+    discover_only: bool = False
     output_spec: OutputSpec = OutputSpec.none()
 
 
@@ -56,6 +69,9 @@ class EthicalAvatureScraper:
             user_agent=settings.user_agent,
             timeout_seconds=settings.timeout_seconds,
             initial_read_timeout_seconds=settings.initial_read_timeout_seconds,
+            verbose=settings.verbose,
+            browser_path=settings.browser_path,
+            browser_engine=settings.browser_engine,
         )
         self.requests_fetcher = RequestsFetcher(fetch_settings)
         self.playwright_headless = PlaywrightFetcher(fetch_settings, headless=True)
@@ -77,17 +93,38 @@ class EthicalAvatureScraper:
         if cached_report is not None:
             report = cache.merge(report, cached_report) if cache else report
 
-        supplied_urls = [normalize_url(url, base_url=target_url) for url in (job_urls or [])]
-
         if report.landing_page and report.landing_page.content:
             landing = report.landing_page
         else:
-            landing, _ = self._guarded_progressive_fetch(target_url, report=report, require_job_page=False)
-            report.landing_page = landing
-            self._write_incremental(cache, report)
+            landing = None
+            tried: list[str] = []
+            for candidate in career_landing_url_candidates(target_url):
+                tried.append(candidate)
+                res, _ = self._guarded_progressive_fetch(candidate, report=report, require_job_page=False)
+                report.landing_page = res
+                self._write_incremental(cache, report)
+                if res and res.ok and res.content:
+                    landing = res
+                    if candidate != target_url:
+                        report.warnings.append(f"Landing page succeeded at {candidate} (seed was {target_url}).")
+                    target_url = candidate
+                    report.target_url = candidate
+                    break
+            if landing is None or not landing.content:
+                report.warnings.append(
+                    "Landing page could not be retrieved with recognizable job content after tries: "
+                    + ", ".join(tried)
+                    + "."
+                )
+                self._write_incremental(cache, report)
+                return report
 
-        if landing is None or not landing.content:
-            report.warnings.append("Landing page could not be retrieved with recognizable job content.")
+        supplied_urls = [normalize_url(url, base_url=target_url) for url in (job_urls or [])]
+
+        if is_linkedin_hosted_careers_landing(landing.content, target_url):
+            report.warnings.append(
+                "Skipped: landing page lists jobs primarily on LinkedIn; no native Avature job URLs to scrape."
+            )
             self._write_incremental(cache, report)
             return report
 
@@ -100,6 +137,12 @@ class EthicalAvatureScraper:
             [*supplied_urls, *report.discovered_job_urls, *discovered_urls]
         )[: self.settings.max_jobs]
         self._write_incremental(cache, report)
+        if self.settings.discover_only:
+            report.warnings.append(
+                "Discover-only mode: collected job URLs from landing content; skipped job-detail fetches."
+            )
+            self._write_incremental(cache, report)
+            return report
 
         if not report.discovered_job_urls:
             if target_url not in {job.url for job in report.jobs}:
@@ -194,14 +237,20 @@ class EthicalAvatureScraper:
         report.robots.append(decision)
         show_robots(decision, verbose=self.settings.verbose)
 
-        if not decision.allowed and not self.settings.angry:
-            if not require_legal_acknowledgement():
-                console.print("[bold green]Stopped safely. No request was made to the disallowed URL.[/]")
-                report.warnings.append(f"Stopped before fetching disallowed URL: {url}")
-                return None, None
-            report.warnings.append(
-                f"Operator explicitly acknowledged legal responsibility before fetching disallowed URL: {url}"
-            )
+        if not decision.allowed:
+            if self.settings.allow_disallowed_robots:
+                report.warnings.append(
+                    "robots.txt disallows this URL for the configured user agent; proceeding anyway because "
+                    "--allow-disallowed-robots was set. You are responsible for authorization and compliance."
+                )
+            elif not self.settings.angry:
+                if not require_legal_acknowledgement():
+                    console.print("[bold green]Stopped safely. No request was made to the disallowed URL.[/]")
+                    report.warnings.append(f"Stopped before fetching disallowed URL: {url}")
+                    return None, None
+                report.warnings.append(
+                    f"Operator explicitly acknowledged legal responsibility before fetching disallowed URL: {url}"
+                )
         
         attempts = [
             ("headful Playwright", self.playwright_headful.fetch, "headful Playwright"),
@@ -212,7 +261,7 @@ class EthicalAvatureScraper:
                 ("headless Playwright", self.playwright_headless.fetch, "headless Playwright"),
             ])
         start_index = 0
-        if require_job_page:
+        if require_job_page and not self.settings.headful_for_each_job:
             start_index = min(self._job_detail_fetch_start_index, len(attempts) - 1)
 
         last_result: FetchResult | None = None
@@ -225,8 +274,9 @@ class EthicalAvatureScraper:
                 explain_next_fetch(fallback_label or "next fetch method")
             elif real_index == start_index and start_index > 0 and not self._job_detail_session_skip_notice_shown:
                 console.print(
-                    "[dim]Skipping HTTP / Playwright tier(s) that did not yield a complete job row on "
-                    "earlier listings this run.[/]"
+                    "[dim]Skipping headful (and earlier) fetch tiers for job-detail URLs: plain HTTP already "
+                    "produced a full job row earlier this run — no visible browser for remaining listings "
+                    "(use --headful-for-each-job to always open headful first).[/]"
                 )
                 self._job_detail_session_skip_notice_shown = True
 

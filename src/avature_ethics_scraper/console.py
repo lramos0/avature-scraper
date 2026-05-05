@@ -174,7 +174,12 @@ def explain_next_fetch(next_method: str) -> None:
             border_style="yellow",
         )
     )
-    input()
+    if sys.stdin.isatty():
+        input()
+    else:
+        console.print(
+            "[dim]Non-interactive stdin: continuing automatically to the next fetch method.[/]"
+        )
 
 
 def show_summary(report: ScrapeReport) -> None:

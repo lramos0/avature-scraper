@@ -2,12 +2,96 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import signal
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import requests
+from typing import Any
 
+from .console import console
 from .models import FetchMethod, FetchResult
+
+
+def wslg_display_env_for_subprocess() -> dict[str, str]:
+    """Extra env vars for worker processes when WSLg is present but DISPLAY was not exported."""
+    if sys.platform == "win32":
+        return {}
+    if os.environ.get("DISPLAY", "").strip() or os.environ.get("WAYLAND_DISPLAY", "").strip():
+        return {}
+    if Path("/mnt/wslg").is_dir():
+        return {"DISPLAY": ":0"}
+    return {}
+
+
+def apply_wslg_display_if_needed() -> None:
+    """Set DISPLAY in-process for WSLg (non-login shells often omit it). Safe to call at CLI startup."""
+    os.environ.update(wslg_display_env_for_subprocess())
+
+
+def _ensure_display_for_headful_unix() -> str | None:
+    """Return an error string if headful GUI cannot run; else None."""
+    apply_wslg_display_if_needed()
+    if sys.platform == "win32":
+        return None
+    if os.environ.get("DISPLAY", "").strip() or os.environ.get("WAYLAND_DISPLAY", "").strip():
+        return None
+    return (
+        "Headful browser needs a display, but DISPLAY and WAYLAND_DISPLAY are unset. "
+        "Fix: run `export DISPLAY=:0` (WSLg) or configure your X server, in the same environment "
+        "that starts parallelize / avature-scraper so child processes inherit it."
+    )
+
+
+def _x_display_socket_ready() -> bool:
+    """Best-effort check that an X display socket exists (to avoid hanging Firefox startups)."""
+    if sys.platform == "win32":
+        return True
+    display = (os.environ.get("DISPLAY") or "").strip()
+    if not display:
+        return False
+    if display.startswith(":"):
+        # Typical local X display in Linux/WSL.
+        suffix = display[1:].split(".")[0]
+        socket_name = f"X{suffix or '0'}"
+        paths = (
+            Path("/tmp/.X11-unix") / socket_name,
+            Path("/mnt/wslg/.X11-unix") / socket_name,
+        )
+        return any(p.exists() for p in paths)
+    # TCP/host-based DISPLAY values are accepted as-is.
+    return True
+
+
+def _resolve_firefox_browser_path_for_linux(path: str | None) -> str | None:
+    """Map common wrapper paths to a native Firefox binary path when possible."""
+    if not path:
+        return path
+    if sys.platform == "win32":
+        return path
+    lowered = path.replace("\\", "/").lower()
+    if lowered in {"/usr/bin/firefox", "/snap/bin/firefox"}:
+        native = Path("/snap/firefox/current/usr/lib/firefox/firefox")
+        if native.is_file():
+            return str(native)
+    return path
+
+
+def _ensure_geckodriver_available() -> str | None:
+    """Return an actionable error when geckodriver is missing (common source of startup hangs)."""
+    if sys.platform == "win32":
+        return None
+    if shutil.which("geckodriver"):
+        return None
+    return (
+        "geckodriver was not found on PATH. Firefox headful startup may hang while Selenium tries to resolve it.\n"
+        "Install geckodriver and retry (Ubuntu/WSL: `sudo apt-get install -y firefox-geckodriver` or "
+        "`sudo apt-get install -y geckodriver`)."
+    )
 
 
 @dataclass(frozen=True)
@@ -15,6 +99,9 @@ class FetchSettings:
     user_agent: str
     timeout_seconds: float = 10.0
     initial_read_timeout_seconds: float = 5.0
+    verbose: bool = False
+    browser_path: str | None = None
+    browser_engine: str = "chromium"
 
     @property
     def extended_timeout_seconds(self) -> float:
@@ -131,60 +218,100 @@ class PlaywrightFetcher:
     def fetch(self, url: str, *, require_job_page: bool = False) -> FetchResult:
         method = FetchMethod.PLAYWRIGHT_HEADLESS if self._headless else FetchMethod.PLAYWRIGHT_HEADFUL
         try:
-            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-            from playwright.sync_api import sync_playwright
+            from playwrong.sync_api import sync_playwright
         except ImportError:
             return FetchResult(
                 url=url,
                 method=method,
                 ok=False,
-                error="Playwright is not installed. Install with: pip install 'aventure-scraper[browser]' && python -m playwright install chromium",
+                error="playwrong is not installed. Install with: pip install -e c:\\Users\\logan\\Projects\\yp_service_processor\\playwrong",
             )
+
+        if not self._headless:
+            disp_err = _ensure_display_for_headful_unix()
+            if disp_err:
+                return FetchResult(url=url, method=method, ok=False, error=disp_err)
+            if not _x_display_socket_ready():
+                return FetchResult(
+                    url=url,
+                    method=method,
+                    ok=False,
+                    error=(
+                        "Headful browser display appears unavailable: DISPLAY is set but no X socket was found "
+                        "at /tmp/.X11-unix or /mnt/wslg/.X11-unix. Firefox launch would hang."
+                    ),
+                )
 
         content = ""
         status_code: int | None = None
         try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=self._headless)
-                context = browser.new_context(user_agent=self._settings.user_agent)
-                page = context.new_page()
-
+            # prefer_open=False avoids noisy "attach to open browser" attempts (Firefox cannot attach via CDP).
+            with sync_playwright(verbose=self._settings.verbose, prefer_open=False) as playwright:
+                launch_kwargs: dict[str, Any] = {"headless": self._headless, "prefer_open": False}
+                engine = (self._settings.browser_engine or "chromium").strip().lower()
+                if engine not in {"chromium", "firefox"}:
+                    self._vlog("playwright", f"unsupported browser engine '{engine}', falling back to chromium")
+                    engine = "chromium"
+                if engine == "firefox":
+                    gecko_err = _ensure_geckodriver_available()
+                    if gecko_err:
+                        return FetchResult(url=url, method=method, ok=False, error=gecko_err)
+                browser_path = self._settings.browser_path
+                if engine == "firefox":
+                    browser_path = _resolve_firefox_browser_path_for_linux(browser_path)
+                if browser_path:
+                    launch_kwargs["browser_path"] = browser_path
+                self._vlog("playwright", f"launch {engine} headless={self._headless} browser_path={browser_path}")
+                browser = None
                 try:
-                    response = page.goto(
-                        url,
-                        wait_until="domcontentloaded",
-                        timeout=int(self._settings.initial_read_timeout_seconds * 1000),
-                    )
-                    status_code = response.status if response else None
-                except PlaywrightTimeoutError:
-                    response = None
+                    if engine == "firefox":
+                        browser = self._launch_with_timeout(playwright.firefox.launch, launch_kwargs)
+                    else:
+                        browser = self._launch_with_timeout(playwright.chromium.launch, launch_kwargs)
+                    context = browser.new_context(user_agent=self._settings.user_agent)
+                    page = context.new_page()
 
-                content = page.content()
-                probe = _probe_content(content, url, require_job_page=require_job_page, partial=True)
-                if probe.state == "bogus":
-                    browser.close()
-                    return FetchResult(
-                        url=url,
-                        method=method,
-                        ok=False,
-                        status_code=status_code,
-                        content=content,
-                        error=f"garbage/non-job data detected early: {probe.reason}",
-                    )
+                    try:
+                        response = page.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=int(self._settings.initial_read_timeout_seconds * 1000),
+                        )
+                        status_code = response.status if response else None
+                    except Exception:
+                        pass
 
-                if probe.state == "inconclusive":
-                    remaining = max(
-                        0.0,
-                        self._settings.extended_timeout_seconds - self._settings.initial_read_timeout_seconds,
-                    )
-                    if remaining > 0:
+                    if not require_job_page:
+                        self._auto_scroll_for_listings(page)
+                    content = page.content()
+                    if not require_job_page:
+                        content = self._expand_jobs_menu_and_collect_pages(page, url, content)
+                    probe = _probe_content(content, url, require_job_page=require_job_page, partial=True)
+                    if probe.state == "bogus":
+                        return FetchResult(
+                            url=url,
+                            method=method,
+                            ok=False,
+                            status_code=status_code,
+                            content=content,
+                            error=f"garbage/non-job data detected early: {probe.reason}",
+                        )
+
+                    if probe.state == "inconclusive":
+                        remaining = max(
+                            0.0,
+                            self._settings.extended_timeout_seconds - self._settings.initial_read_timeout_seconds,
+                        )
+                        if remaining > 0:
+                            self._wait_for_load_state(page, "networkidle", int(remaining * 1000))
+                            content = page.content()
+                finally:
+                    if browser is not None:
+                        self._vlog("playwright", "closing browser session")
                         try:
-                            page.wait_for_load_state("networkidle", timeout=int(remaining * 1000))
-                        except PlaywrightTimeoutError:
+                            browser.close()
+                        except Exception:
                             pass
-                        content = page.content()
-
-                browser.close()
         except Exception as exc:  # Playwright raises several runtime-specific exception classes.
             return FetchResult(
                 url=url,
@@ -205,6 +332,414 @@ class PlaywrightFetcher:
             error=None if probe.state == "usable" else probe.reason,
         )
 
+    def _launch_with_timeout(self, launch_fn, launch_kwargs: dict[str, Any]):
+        """Prevent indefinite browser-launch hangs (common with Firefox/geckodriver in WSL)."""
+        timeout_s = max(10, int(self._settings.initial_read_timeout_seconds))
+        if sys.platform == "win32":
+            return launch_fn(**launch_kwargs)
+
+        def _alarm_handler(_signum, _frame):
+            raise TimeoutError(f"browser launch timed out after {timeout_s}s")
+
+        previous = signal.getsignal(signal.SIGALRM)
+        try:
+            signal.signal(signal.SIGALRM, _alarm_handler)
+            signal.alarm(timeout_s)
+            return launch_fn(**launch_kwargs)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+
+    def _page_url(self, page) -> str:
+        """playwrong CDP Page has .url; FirefoxPage (Selenium) does not — use current_url."""
+        raw = getattr(page, "url", None)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        driver = getattr(page, "_driver", None)
+        if driver is not None:
+            try:
+                return str(getattr(driver, "current_url", "") or "")
+            except Exception:
+                pass
+        return ""
+
+    def _auto_scroll_for_listings(self, page) -> None:
+        """Scroll until listing cards appear, or until bottom is reached."""
+        try:
+            self._vlog("playwright", "auto-scroll start (landing page)")
+            max_passes = 40
+            for idx in range(max_passes):
+                if self._page_has_epic_job_listing_cards(page):
+                    self._vlog("scroll", f"cards detected before pass {idx + 1}; stopping scroll")
+                    break
+                before = self._page_eval(
+                    page,
+                    """
+                    () => {
+                      const nodes = Array.from(document.querySelectorAll('*'));
+                      let best = null;
+                      for (const n of nodes) {
+                        if (!(n instanceof HTMLElement)) continue;
+                        const style = window.getComputedStyle(n);
+                        const overflowY = style.overflowY;
+                        const scrollable = (overflowY === 'auto' || overflowY === 'scroll') && n.scrollHeight > (n.clientHeight + 8);
+                        if (!scrollable) continue;
+                        const score = n.clientHeight;
+                        if (!best || score > best.score) {
+                          best = { score, top: n.scrollTop, max: n.scrollHeight - n.clientHeight };
+                        }
+                      }
+                      return {
+                        y: window.scrollY,
+                        h: document.body.scrollHeight,
+                        vh: window.innerHeight,
+                        containerTop: best ? best.top : null,
+                        containerMax: best ? best.max : null
+                      };
+                    }
+                    """
+                )
+                self._vlog(
+                    "scroll",
+                    f"pass {idx + 1}/{max_passes} before: y={before['y']}, h={before['h']}, "
+                    f"containerTop={before['containerTop']}, containerMax={before['containerMax']}",
+                )
+                self._page_eval(
+                    page,
+                    """
+                    () => {
+                      const step = Math.max(500, Math.floor(window.innerHeight * 0.9));
+                      // Scroll page itself.
+                      window.scrollBy(0, step);
+                      // Also scroll the largest scrollable container (if present).
+                      const nodes = Array.from(document.querySelectorAll('*'));
+                      let best = null;
+                      for (const n of nodes) {
+                        if (!(n instanceof HTMLElement)) continue;
+                        const style = window.getComputedStyle(n);
+                        const overflowY = style.overflowY;
+                        const scrollable = (overflowY === 'auto' || overflowY === 'scroll') && n.scrollHeight > (n.clientHeight + 8);
+                        if (!scrollable) continue;
+                        const score = n.clientHeight;
+                        if (!best || score > best.score) best = { node: n, score };
+                      }
+                      if (best && best.node) {
+                        best.node.scrollBy(0, step);
+                      }
+                    }
+                    """
+                )
+                self._wait_for_timeout(page, 220)
+                after = self._page_eval(
+                    page,
+                    """
+                    () => {
+                      const nodes = Array.from(document.querySelectorAll('*'));
+                      let best = null;
+                      for (const n of nodes) {
+                        if (!(n instanceof HTMLElement)) continue;
+                        const style = window.getComputedStyle(n);
+                        const overflowY = style.overflowY;
+                        const scrollable = (overflowY === 'auto' || overflowY === 'scroll') && n.scrollHeight > (n.clientHeight + 8);
+                        if (!scrollable) continue;
+                        const score = n.clientHeight;
+                        if (!best || score > best.score) {
+                          best = { score, top: n.scrollTop, max: n.scrollHeight - n.clientHeight };
+                        }
+                      }
+                      return {
+                        y: window.scrollY,
+                        h: document.body.scrollHeight,
+                        vh: window.innerHeight,
+                        containerTop: best ? best.top : null,
+                        containerMax: best ? best.max : null
+                      };
+                    }
+                    """
+                )
+                self._vlog(
+                    "scroll",
+                    f"pass {idx + 1}/{max_passes} after: y={after['y']}, h={after['h']}, "
+                    f"containerTop={after['containerTop']}, containerMax={after['containerMax']}",
+                )
+                at_or_near_bottom = (after["y"] + after["vh"]) >= (after["h"] - 8)
+                container_at_bottom = (
+                    after["containerTop"] is not None
+                    and after["containerMax"] is not None
+                    and after["containerTop"] >= (after["containerMax"] - 8)
+                )
+                no_page_progress = after["y"] <= before["y"] and after["h"] <= before["h"]
+                no_container_progress = (
+                    before["containerTop"] is None
+                    or after["containerTop"] is None
+                    or after["containerTop"] <= before["containerTop"]
+                )
+                no_progress = no_page_progress and no_container_progress
+                if (at_or_near_bottom and container_at_bottom) or no_progress:
+                    self._vlog(
+                        "scroll",
+                        f"stop condition met (bottom={at_or_near_bottom and container_at_bottom}, "
+                        f"no_progress={no_progress})",
+                    )
+                    break
+            if not self._page_has_epic_job_listing_cards(page):
+                # One final settle wait for late hydration before giving up.
+                self._vlog("scroll", "cards still not found after scrolling; waiting final settle window")
+                self._wait_for_timeout(page, 500)
+            else:
+                self._vlog("scroll", "cards found after scrolling")
+            self._page_eval(
+                page,
+                """
+                () => {
+                  window.scrollTo(0, 0);
+                  const nodes = Array.from(document.querySelectorAll('*'));
+                  for (const n of nodes) {
+                    if (!(n instanceof HTMLElement)) continue;
+                    const style = window.getComputedStyle(n);
+                    const overflowY = style.overflowY;
+                    const scrollable = (overflowY === 'auto' || overflowY === 'scroll') && n.scrollHeight > (n.clientHeight + 8);
+                    if (scrollable) n.scrollTop = 0;
+                  }
+                }
+                """
+            )
+            self._vlog("playwright", "auto-scroll done; viewport reset to top")
+        except Exception:
+            self._vlog("playwright", "auto-scroll failed with exception")
+            return
+
+    def _expand_jobs_menu_and_collect_pages(self, page, _base_url: str, initial_content: str) -> str:
+        """Expand the Jobs submenu and stitch submenu page HTML into one discovery document."""
+        if self._page_has_epic_job_listing_cards(page) or _has_epic_job_listing_cards(initial_content):
+            # Landing page already has the listing-card structure we want.
+            self._vlog("discovery", "landing already contains listing cards; skipping Jobs submenu traversal")
+            return initial_content
+
+        combined_sections: list[str] = [initial_content]
+        visited: set[str] = set()
+        original_url = self._page_url(page)
+        if self._hover_jobs_menu(page):
+            self._vlog("discovery", "hovered Jobs menuitem successfully")
+        else:
+            self._vlog("discovery", "failed to hover Jobs menuitem; using landing content only")
+            return initial_content
+
+        resolved_urls = self._jobs_submenu_urls(page)
+        if not resolved_urls:
+            self._vlog("discovery", "failed to read Jobs submenu links; using landing content only")
+            return initial_content
+        self._vlog("discovery", f"Jobs submenu links discovered: {len(resolved_urls)}")
+
+        for target_url in resolved_urls:
+            if target_url in visited:
+                continue
+            visited.add(target_url)
+            try:
+                response = page.goto(
+                    target_url,
+                    wait_until="domcontentloaded",
+                    timeout=int(self._settings.timeout_seconds * 1000),
+                )
+                if response is not None and response.status >= 400:
+                    self._vlog("discovery", f"submenu page HTTP {response.status}: {target_url}")
+                    continue
+                self._wait_for_load_state(page, "networkidle", 2500)
+                page_html = page.content()
+                if self._page_has_epic_job_listing_cards(page) or _has_epic_job_listing_cards(page_html):
+                    self._vlog("discovery", f"listing cards found on submenu page: {target_url}")
+                    combined_sections.append(page_html)
+                    continue
+                if self._apply_links_lead_to_listing_cards(page, current_category_url=target_url):
+                    self._vlog("discovery", f"listing cards found via Apply probe from: {target_url}")
+                    combined_sections.append(page.content())
+                    continue
+                if _has_epic_apply_only_state(page_html) or self._page_has_epic_apply_links(page):
+                    # Category has Apply CTA(s) but no listing cards after probing; treat as empty.
+                    self._vlog("discovery", f"apply-only category skipped (no listing cards): {target_url}")
+                    continue
+            except Exception:
+                self._vlog("discovery", f"submenu traversal failed for: {target_url}")
+                continue
+
+        if original_url and self._page_url(page) != original_url:
+            try:
+                page.goto(original_url, wait_until="domcontentloaded", timeout=int(self._settings.timeout_seconds * 1000))
+            except Exception:
+                pass
+        self._vlog("discovery", f"combined discovery documents: {len(combined_sections)}")
+        return "\n".join(combined_sections)
+
+    def _page_has_epic_job_listing_cards(self, page) -> bool:
+        try:
+            card_count = self._dom_count(page, "div.p-6.mt-3.bg-white.rounded-xl")
+            card_count += self._dom_count(page, "div.p-6.mt-3.bg-white.rounded-x1")
+            if card_count > 0:
+                return True
+            return (
+                self._dom_count(page, "p[id^='jobs_matching_positions_'][id$='_title']") > 0
+                and self._dom_count(page, "a[href*='/Careers/FolderDetail/']") > 0
+            )
+        except Exception:
+            return False
+
+    def _page_has_epic_apply_links(self, page) -> bool:
+        try:
+            return self._dom_count(page, "a[href*='/Careers/RegisterMethod?folderId=']") > 0
+        except Exception:
+            return False
+
+    def _apply_links_lead_to_listing_cards(self, page, *, current_category_url: str) -> bool:
+        """Probe Apply CTAs. If they never produce listing cards, treat category as empty."""
+        apply_urls = self._dom_hrefs(page, "a[href*='/Careers/RegisterMethod?folderId=']")
+        if not apply_urls:
+            self._vlog("apply-probe", "no apply links found on category page")
+            return False
+        self._vlog("apply-probe", f"apply links found: {len(apply_urls)} (probing up to 5)")
+
+        seen: set[str] = set()
+        for apply_url in apply_urls[:5]:
+            if apply_url in seen:
+                continue
+            seen.add(apply_url)
+            try:
+                response = page.goto(
+                    apply_url,
+                    wait_until="domcontentloaded",
+                    timeout=int(self._settings.timeout_seconds * 1000),
+                )
+                if response is not None and response.status >= 400:
+                    self._vlog("apply-probe", f"apply url HTTP {response.status}: {apply_url}")
+                    continue
+                self._wait_for_load_state(page, "networkidle", 2500)
+                if self._page_has_epic_job_listing_cards(page):
+                    self._vlog("apply-probe", f"listing cards discovered via apply url: {apply_url}")
+                    return True
+            except Exception:
+                self._vlog("apply-probe", f"apply probe failed for: {apply_url}")
+                continue
+            finally:
+                try:
+                    page.goto(
+                        current_category_url,
+                        wait_until="domcontentloaded",
+                        timeout=int(self._settings.timeout_seconds * 1000),
+                    )
+                except Exception:
+                    pass
+        self._vlog("apply-probe", "apply probes completed; no listing cards discovered")
+        return False
+
+    def _wait_for_load_state(self, page, state: str, timeout_ms: int) -> None:
+        try:
+            if hasattr(page, "wait_for_load_state"):
+                page.wait_for_load_state(state, timeout=timeout_ms)
+                return
+        except Exception:
+            return
+
+    def _wait_for_timeout(self, page, timeout_ms: int) -> None:
+        try:
+            if hasattr(page, "wait_for_timeout"):
+                page.wait_for_timeout(timeout_ms)
+                return
+        except Exception:
+            pass
+        time.sleep(max(0, timeout_ms) / 1000.0)
+
+    def _hover_jobs_menu(self, page) -> bool:
+        try:
+            if hasattr(page, "locator"):
+                page.locator("#secondarytoolbar_submenu_Jobs [role='menuitem']").first.hover(timeout=2500)
+                return True
+            result = self._page_eval(
+                page,
+                """
+                () => {
+                  const menu = document.querySelector("#secondarytoolbar_submenu_Jobs [role='menuitem']");
+                  if (!menu) return false;
+                  menu.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+                  menu.dispatchEvent(new FocusEvent("focus", { bubbles: true }));
+                  return true;
+                }
+                """,
+            )
+            return bool(result)
+        except Exception:
+            return False
+
+    def _jobs_submenu_urls(self, page) -> list[str]:
+        urls = self._dom_hrefs(page, "#secondarytoolbar_submenu_contents_Jobs a[role='menuitem'][href]")
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for url in urls:
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            deduped.append(url)
+        return deduped
+
+    def _dom_hrefs(self, page, selector: str) -> list[str]:
+        try:
+            result = self._page_eval(
+                page,
+                f"""() => Array.from(document.querySelectorAll({selector!r}))
+                      .map(el => (el instanceof HTMLAnchorElement ? el.href : (el.getAttribute("href") || "")))
+                      .map(v => String(v || "").trim())
+                      .filter(Boolean)""",
+            )
+            return [str(item) for item in (result or [])]
+        except Exception:
+            self._vlog("dom", f"failed to collect hrefs for selector: {selector}")
+            return []
+
+    def _dom_count(self, page, selector: str) -> int:
+        try:
+            result = self._page_eval(
+                page,
+                f"() => document.querySelectorAll({selector!r}).length",
+            )
+            return int(result or 0)
+        except Exception:
+            return 0
+
+    def _page_eval(self, page, expression: str) -> Any:
+        if hasattr(page, "evaluate"):
+            return page.evaluate(expression)
+        driver = getattr(page, "_driver", None)
+        if driver is not None:
+            # playwrong FirefoxPage uses selenium under the hood.
+            return driver.execute_script(f"return ({expression})()")
+        # playwrong Page exposes the underlying CDP session.
+        session = getattr(page, "_session", None)
+        if session is None:
+            raise RuntimeError("page object does not support evaluate or CDP session eval")
+        result = session.send(
+            "Runtime.evaluate",
+            {"expression": f"({expression})()", "returnByValue": True},
+            timeout_seconds=max(5.0, self._settings.timeout_seconds),
+        )
+        return (((result or {}).get("result") or {}).get("value")) if isinstance(result, dict) else None
+
+    def _vlog(self, scope: str, message: str) -> None:
+        if not self._settings.verbose:
+            return
+        console.print(f"[dim][playwright:{scope}] {message}[/]")
+
+
+def _has_epic_job_listing_cards(content: str) -> bool:
+    lowered = content.lower()
+    has_title_marker = 'id="jobs_matching_positions_' in lowered and "_title" in lowered
+    has_folder_links = "/careers/folderdetail/" in lowered
+    return has_title_marker and has_folder_links
+
+
+def _has_epic_apply_only_state(content: str) -> bool:
+    lowered = content.lower()
+    has_apply = ">apply<" in lowered and "/careers/registermethod?folderid=" in lowered
+    has_cards = _has_epic_job_listing_cards(content)
+    return has_apply and not has_cards
+
 
 def _decode_chunks(chunks: list[bytes], encoding: str | None) -> str:
     raw = b"".join(chunks)
@@ -214,6 +749,8 @@ def _decode_chunks(chunks: list[bytes], encoding: str | None) -> str:
 def _probe_content(content: str, url: str, *, require_job_page: bool, partial: bool) -> ContentProbe:
     """Classify fetched content without waiting for the full timeout when it is clearly bad."""
     lowered = content.lower()
+    if _has_epic_job_listing_cards(content):
+        return ContentProbe("usable", "Epic listing cards were detected on the page.")
     hard_bogus_markers = (
         "save application registration",
         "do you have an account? log in",

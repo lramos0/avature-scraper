@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "playwrong"
+version = "0.1.0"
+description = "Custom CDP browser driver that prefers reusing open Chromium instances."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "selenium>=4.20.0",
+  "websocket-client>=1.8.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["playwrong*", "undetected_geckodriver*"]

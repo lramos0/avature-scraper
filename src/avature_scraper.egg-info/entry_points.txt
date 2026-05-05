@@ -1,0 +1,2 @@
+[console_scripts]
+avature-scraper = avature_ethics_scraper.cli:app

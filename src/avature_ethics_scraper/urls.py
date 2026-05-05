@@ -10,6 +10,36 @@ class UrlValidationError(ValueError):
     """Raised when a URL should not be fetched."""
 
 
+# Common Avature / career-site entry paths (try in order after any explicit seed path).
+_CAREER_LANDING_REL_PATHS: tuple[str, ...] = ("/careers", "/eng_US/careers", "/jobs")
+
+
+def career_landing_url_candidates(seed: str) -> list[str]:
+    """Return ordered absolute URLs to try for a career homepage (same origin as *seed*).
+
+    Always includes ``/careers``, ``/eng_US/careers``, and ``/jobs``. If *seed* has a non-root
+    path, that URL is tried first (once).
+    """
+    normalized = normalize_url(seed)
+    parsed = urlparse(normalized)
+    origin = f"{parsed.scheme}://{parsed.netloc.lower()}"
+    seen: set[str] = set()
+    ordered: list[str] = []
+
+    def push(url: str) -> None:
+        u = normalize_url(url)
+        if u not in seen:
+            seen.add(u)
+            ordered.append(u)
+
+    path = (parsed.path or "").rstrip("/")
+    if path:
+        push(normalized)
+    for rel in _CAREER_LANDING_REL_PATHS:
+        push(normalize_url(rel, base_url=origin))
+    return ordered
+
+
 def normalize_url(url: str, *, base_url: str | None = None) -> str:
     """Return an absolute, defragmented HTTP(S) URL."""
     candidate = urljoin(base_url, url) if base_url else url

@@ -18,11 +18,16 @@ from .output_spec import MAX_JOB_DESCRIPTION_CHARS, OutputSpec
 from .urls import normalize_url, same_host, stable_id_from_url
 
 _JOB_PATH_RE = re.compile(
-    r"(?:jobdetail|job-detail|jobs?/detail|requisition|career|careers|positions?|openings?)",
+    r"(?:jobdetail|job-detail|folderdetail|jobs?/detail|requisition|career|careers|positions?|openings?)",
     re.IGNORECASE,
 )
 _REQ_LABEL_RE = re.compile(r"\b(?:req(?:uisition)?(?:\s+id)?|job\s+id|job\s+number)[\s#:-]+([A-Z0-9_-]{3,})\b", re.IGNORECASE)
 _URL_JOB_ID_RE = re.compile(r"/(\d{3,})(?:[/?#]|$)")
+_FOLD_DETAIL_RE = re.compile(r"/FolderDetail/", re.I)
+_LOCATION_FROM_TEXT_RE = re.compile(
+    r"(?:^|[\n\r]|\b)\s*Location\s*[:\s]\s*(.+?)(?=\n|\r|$|(?:\b(?:Work\s+Type|Department|Salary|Apply)\b))",
+    re.IGNORECASE | re.MULTILINE,
+)
 _WHITESPACE_RE = re.compile(r"\s+")
 _DATE_RE = re.compile(r"\b(?:20\d{2}|19\d{2})[-/](?:0?[1-9]|1[0-2])[-/](?:0?[1-9]|[12]\d|3[01])\b")
 _PAY_RE = re.compile(
@@ -274,9 +279,49 @@ def parse_avature_inline_job_header(raw_visible: str | None) -> dict[str, Any]:
     }
 
 
+def _location_from_folder_detail_page(soup: BeautifulSoup, visible_text: str, url: str) -> str | None:
+    """Extra location signals for Avature FolderDetail / Epic-style postings (often sparse vs JobDetail)."""
+    if not _FOLD_DETAIL_RE.search(url or ""):
+        return None
+    for sel in (
+        "[id*='location' i]",
+        "[id*='Location']",
+        "[data-automation-id*='location' i]",
+        "[class*='location' i]",
+    ):
+        try:
+            t = _selector_text(soup, sel)
+        except ValueError:
+            continue
+        if t and len(t) < 200 and not t.lower().startswith("http"):
+            return t
+    m = _LOCATION_FROM_TEXT_RE.search(visible_text or "")
+    if m:
+        cand = _clean_text(m.group(1))
+        if cand and len(cand) < 200:
+            return cand
+    # Inline "Location …" without newline (single-line or paragraph).
+    m2 = re.search(r"\bLocation\s*[:\s]\s*([^\n\r]{2,120})", visible_text or "", re.I)
+    if m2:
+        return _clean_text(m2.group(1))
+    return None
+
+
+def _fallback_location_when_missing(url: str) -> tuple[str, str | None]:
+    """Guarantee a non-empty location for default output when the page truly omits it."""
+    if _FOLD_DETAIL_RE.search(url or ""):
+        text = "Not specified on posting"
+        note = (
+            "Location was not found on this FolderDetail page; defaulted to 'Not specified on posting' "
+            "so the row meets required columns — verify manually or enrich from the source."
+        )
+        return text, note
+    return "", None
+
+
 def _job_title_from_avature_detail_url(url: str) -> str | None:
-    """Derive a human title from /JobDetail/Slug-Here/12345 when DOM title is only the employer name."""
-    m = re.search(r"/(?:JobDetail|job-detail)/([^/]+)/(\d{3,})(?:[/?#]|$)", url, re.I)
+    """Derive a human title from /JobDetail|FolderDetail/Slug-Here/12345 URLs."""
+    m = re.search(r"/(?:JobDetail|job-detail|FolderDetail)/([^/]+)/(\d{3,})(?:[/?#]|$)", url, re.I)
     if not m:
         return None
     slug = m.group(1).replace("-", " ")
@@ -353,7 +398,19 @@ def extract_job_record(html: str, url: str) -> JobSummary:
     )
     title = _clean_title(title)
 
-    location = _first_non_empty(av.get("location"), location)
+    location = _first_non_empty(
+        av.get("location"),
+        location,
+        _location_from_folder_detail_page(soup, body_text or "", url),
+        _location_from_folder_detail_page(soup, full_desc or "", url),
+    )
+
+    if not (location or "").strip():
+        fb_text, fb_note = _fallback_location_when_missing(url)
+        if fb_text:
+            location = fb_text
+            if fb_note:
+                dq_notes.append(fb_note)
 
     job_posted_date = _first_non_empty(
         ld_flat.get("job_posted_date"),
@@ -592,17 +649,51 @@ def validate_job_page(html: str, url: str) -> tuple[bool, str]:
 
     return True, f"usable job detail page (score {content_score.score})."
 
+
 def _looks_like_job_url(url: str, label: str) -> bool:
     parsed = urlparse(url)
     haystack = f"{parsed.path} {parsed.query} {label}"
     lowered = haystack.lower()
     if is_bogus_job_url(url) or any(bad in label.lower() for bad in _BAD_JOB_URL_MARKERS):
         return False
-    if "jobdetail" in lowered or "job-detail" in lowered or "jobs/detail" in lowered:
+    if any(token in lowered for token in ("jobdetail", "job-detail", "folderdetail", "jobs/detail")):
         return True
     if not _JOB_PATH_RE.search(haystack):
         return False
     return any(token in lowered for token in ("req", "requisition", "position", "opening", "jobid="))
+
+
+def is_linkedin_hosted_careers_landing(html: str, base_url: str) -> bool:
+    """True when the landing page mainly points at LinkedIn job URLs, not native Avature listings (e.g. Xerox)."""
+    if not html or "linkedin.com" not in html.lower():
+        return False
+    soup = BeautifulSoup(html, "html.parser")
+    linkedin_job_links = 0
+    native_job_links = 0
+    for anchor in soup.find_all("a", href=True):
+        href_raw = str(anchor.get("href", "")).strip()
+        if not href_raw:
+            continue
+        hlow = href_raw.lower()
+        if "linkedin.com/jobs" in hlow or "linkedin.com/job/" in hlow:
+            linkedin_job_links += 1
+            continue
+        try:
+            absolute = normalize_url(href_raw, base_url=base_url)
+        except ValueError:
+            continue
+        if not same_host(absolute, base_url):
+            continue
+        path = urlparse(absolute).path.lower()
+        if any(seg in path for seg in ("jobdetail", "job-detail", "folderdetail", "/jobs/detail")):
+            native_job_links += 1
+    if native_job_links >= 2:
+        return False
+    if linkedin_job_links >= 2 and native_job_links == 0:
+        return True
+    if linkedin_job_links >= 5 and native_job_links <= 1:
+        return True
+    return False
 
 
 def _selector_text(soup: BeautifulSoup, selector: str) -> str | None:
@@ -653,7 +744,7 @@ def _bad_job_url_marker_hits(url: str) -> list[str]:
 def _is_job_detail_url(url: str) -> bool:
     parsed = urlparse(url)
     haystack = f"{parsed.path} {parsed.query}".lower()
-    return "jobdetail" in haystack or "job-detail" in haystack or "jobs/detail" in haystack
+    return any(token in haystack for token in ("jobdetail", "job-detail", "folderdetail", "jobs/detail"))
 
 
 def _structured_job_metadata(soup: BeautifulSoup) -> dict[str, str]:
