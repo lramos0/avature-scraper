@@ -9,7 +9,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -126,9 +126,39 @@ class JobContentScore:
     reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ListingPaginationLegend:
+    range_start: int
+    range_end: int
+    total_results: int
+    page_size: int
+
+
+@dataclass(frozen=True)
+class ListingDiscoverySignals:
+    job_urls: list[str]
+    query_param_hints: tuple[str, ...]
+    pagination_legend: ListingPaginationLegend | None
+
+
 def discover_job_urls(html: str, base_url: str, *, same_host_only: bool = True) -> list[str]:
+    return extract_listing_discovery_signals(
+        html,
+        base_url,
+        same_host_only=same_host_only,
+    ).job_urls
+
+
+def extract_listing_discovery_signals(
+    html: str,
+    base_url: str,
+    *,
+    same_host_only: bool = True,
+) -> ListingDiscoverySignals:
     soup = BeautifulSoup(html, "html.parser")
     discovered: set[str] = set()
+    query_param_hints: set[str] = set()
+    pagination_legend = _extract_pagination_legend(soup)
 
     for anchor in soup.find_all("a", href=True):
         href = str(anchor.get("href", "")).strip()
@@ -138,22 +168,95 @@ def discover_job_urls(html: str, base_url: str, *, same_host_only: bool = True) 
             absolute = normalize_url(href, base_url=base_url)
         except ValueError:
             continue
+        absolute = _unwrap_avature_share_proxy_url(absolute, base_url=base_url) or absolute
         if same_host_only and not same_host(absolute, base_url):
             continue
         if _looks_like_job_url(absolute, anchor.get_text(" ", strip=True)):
             discovered.add(absolute)
+
+    for element in soup.select("[data-url], [data-href], [data-link]"):
+        for attr in ("data-url", "data-href", "data-link"):
+            raw = str(element.get(attr, "")).strip()
+            if not raw:
+                continue
+            try:
+                absolute = normalize_url(raw, base_url=base_url)
+            except ValueError:
+                continue
+            absolute = _unwrap_avature_share_proxy_url(absolute, base_url=base_url) or absolute
+            if same_host_only and not same_host(absolute, base_url):
+                continue
+            _collect_query_param_hints(absolute, query_param_hints)
+            if _looks_like_job_url(absolute, ""):
+                discovered.add(absolute)
 
     for match in re.finditer(r"https?://[^\s'\"<>]+", html):
         try:
             absolute = normalize_url(match.group(0), base_url=base_url)
         except ValueError:
             continue
+        absolute = _unwrap_avature_share_proxy_url(absolute, base_url=base_url) or absolute
         if same_host_only and not same_host(absolute, base_url):
             continue
+        _collect_query_param_hints(absolute, query_param_hints)
         if _looks_like_job_url(absolute, ""):
             discovered.add(absolute)
 
-    return sorted(discovered)
+    for script in soup.find_all("script"):
+        raw = script.string if script.string is not None else script.get_text(" ", strip=False)
+        if not raw:
+            continue
+        script_candidates = re.findall(r"https?://[^\s'\"<>\\]+", raw)
+        script_candidates.extend(
+            re.findall(
+                r"/(?:[A-Za-z0-9_.-]+/)*(?:careers|jobs)/[A-Za-z0-9_.\-/?=&%]+",
+                raw,
+            )
+        )
+        for candidate in script_candidates:
+            try:
+                absolute = normalize_url(candidate, base_url=base_url)
+            except ValueError:
+                continue
+            absolute = _unwrap_avature_share_proxy_url(absolute, base_url=base_url) or absolute
+            if same_host_only and not same_host(absolute, base_url):
+                continue
+            _collect_query_param_hints(absolute, query_param_hints)
+            if _looks_like_job_url(absolute, ""):
+                discovered.add(absolute)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        json_strings: list[str] = []
+        _collect_strings_from_json(payload, json_strings)
+        for value in json_strings:
+            if "/" not in value and "http" not in value.lower():
+                continue
+            try:
+                absolute = normalize_url(value, base_url=base_url)
+            except ValueError:
+                continue
+            absolute = _unwrap_avature_share_proxy_url(absolute, base_url=base_url) or absolute
+            if same_host_only and not same_host(absolute, base_url):
+                continue
+            _collect_query_param_hints(absolute, query_param_hints)
+            if _looks_like_job_url(absolute, ""):
+                discovered.add(absolute)
+
+    lowered = html.lower()
+    if "joboffset" in lowered:
+        query_param_hints.add("jobOffset")
+    if "jobrecordsperpage" in lowered:
+        query_param_hints.add("jobRecordsPerPage")
+    if "listfiltermode" in lowered:
+        query_param_hints.add("listFilterMode")
+
+    return ListingDiscoverySignals(
+        job_urls=sorted(discovered),
+        query_param_hints=tuple(sorted(query_param_hints)),
+        pagination_legend=pagination_legend,
+    )
 
 
 def extract_job_summary(html: str, url: str) -> JobSummary:
@@ -654,6 +757,8 @@ def _looks_like_job_url(url: str, label: str) -> bool:
     parsed = urlparse(url)
     haystack = f"{parsed.path} {parsed.query} {label}"
     lowered = haystack.lower()
+    if "_linkedinapiv2" in parsed.path.lower():
+        return False
     if is_bogus_job_url(url) or any(bad in label.lower() for bad in _BAD_JOB_URL_MARKERS):
         return False
     if any(token in lowered for token in ("jobdetail", "job-detail", "folderdetail", "jobs/detail")):
@@ -661,6 +766,77 @@ def _looks_like_job_url(url: str, label: str) -> bool:
     if not _JOB_PATH_RE.search(haystack):
         return False
     return any(token in lowered for token in ("req", "requisition", "position", "opening", "jobid="))
+
+
+def _collect_query_param_hints(url: str, out: set[str]) -> None:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return
+    for key in parse_qs(parsed.query or "").keys():
+        if key:
+            out.add(key)
+
+
+def _collect_strings_from_json(value: Any, out: list[str]) -> None:
+    if isinstance(value, str):
+        out.append(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_strings_from_json(item, out)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _collect_strings_from_json(item, out)
+
+
+def _extract_pagination_legend(soup: BeautifulSoup) -> ListingPaginationLegend | None:
+    legend = soup.select_one(".list-controls__text__legend")
+    if not legend:
+        return None
+    text = _clean_text(legend.get_text(" ", strip=True)) or ""
+    m = re.search(r"(\d+)\s*-\s*(\d+)\s*of\s*(\d+)", text, re.I)
+    if not m:
+        return None
+    range_start = int(m.group(1))
+    range_end = int(m.group(2))
+    total_results = int(m.group(3))
+    if range_start <= 0 or range_end < range_start or total_results <= 0:
+        return None
+    page_size = (range_end - range_start) + 1
+    if page_size <= 0:
+        return None
+    return ListingPaginationLegend(
+        range_start=range_start,
+        range_end=range_end,
+        total_results=total_results,
+        page_size=page_size,
+    )
+
+
+def _unwrap_avature_share_proxy_url(url: str, *, base_url: str) -> str | None:
+    """Convert Avature social/share proxy links to the real job URL when present.
+
+    Example:
+    /_linkedinApiv2?...&shareUrl=https://tenant.avature.net/en_US/careers/JobDetail/Role/123
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if "_linkedinapiv2" not in parsed.path.lower():
+        return None
+    qs = parse_qs(parsed.query or "")
+    share_values = qs.get("shareUrl") or qs.get("shareurl") or []
+    for raw in share_values:
+        try:
+            candidate = normalize_url(raw, base_url=base_url)
+        except ValueError:
+            continue
+        if _is_job_detail_url(candidate):
+            return candidate
+    return None
 
 
 def is_linkedin_hosted_careers_landing(html: str, base_url: str) -> bool:

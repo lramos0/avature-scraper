@@ -1,6 +1,7 @@
 from avature_ethics_scraper.cache import ReportCache
 from avature_ethics_scraper.extract import (
     discover_job_urls,
+    extract_listing_discovery_signals,
     extract_job_summary,
     score_job_listing_content,
     validate_job_page,
@@ -15,6 +16,42 @@ def test_discovery_rejects_save_job_links():
     '''
     urls = discover_job_urls(html, "https://bloomberg.avature.net/careers")
     assert urls == ["https://bloomberg.avature.net/careers/JobDetail/Senior-Software-Engineer/18957"]
+
+
+def test_discovery_unwraps_avature_linkedin_share_proxy_links():
+    html = """
+    <a href="/_linkedinApiv2?portalUrl=https%3A%2F%2Fxerox.avature.net%2F&action=INIT_SHARE&shareUrl=https%3A%2F%2Fxerox.avature.net%2Fen_US%2Fcareers%2FJobDetail%2FAccounting-Analyst%2F49507">
+      share
+    </a>
+    <a href="https://xerox.avature.net/en_US/careers/JobDetail/Accounting-Analyst/49507">detail</a>
+    """
+    urls = discover_job_urls(html, "https://xerox.avature.net/en_US/careers")
+    assert urls == ["https://xerox.avature.net/en_US/careers/JobDetail/Accounting-Analyst/49507"]
+
+
+def test_discovery_finds_job_urls_inside_script_json():
+    html = """
+    <script type="application/json">
+      {"jobs":[{"url":"https://example.avature.net/careers/JobDetail/Data-Engineer/12345"}]}
+    </script>
+    """
+    urls = discover_job_urls(html, "https://example.avature.net/careers")
+    assert urls == ["https://example.avature.net/careers/JobDetail/Data-Engineer/12345"]
+
+
+def test_listing_discovery_extracts_pagination_legend_and_hints():
+    html = """
+    <div class="list-controls__text__legend">1 - 25 of 240</div>
+    <script>
+      window.__state = {"pagination":{"jobOffset":0,"jobRecordsPerPage":25}};
+    </script>
+    """
+    signals = extract_listing_discovery_signals(html, "https://example.avature.net/careers")
+    assert signals.pagination_legend is not None
+    assert signals.pagination_legend.page_size == 25
+    assert signals.pagination_legend.total_results == 240
+    assert "jobOffset" in signals.query_param_hints
+    assert "jobRecordsPerPage" in signals.query_param_hints
 
 
 def test_validate_job_page_rejects_registration_garbage():

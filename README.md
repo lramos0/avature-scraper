@@ -1,6 +1,82 @@
-# aventure-scraper
+# avature-scraper
 
 Ethical, **robots.txt-first** CLI for Avature-hosted career sites. It is meant as a reference implementation: polite delays, incremental JSON cache, progressive fetch (HTTP → headless Chromium → headful Chromium), and explicit legal gates on disallowed URLs.
+
+This README focuses on the **normal pip + single-run CLI workflow**.
+For parallel/Windows operator flow, use `README.unhinged.md`.
+
+## Agent Guide
+
+If you are an AI coding assistant (Claude/OpenAI/Cursor/etc.), read `ai-agent.md` first. It is the deep technical guide for how this repo works end-to-end (architecture, fetch/discovery flow, batch semantics, CDP/playwrong behavior, and failure modes).
+
+## Pip Tooling (Primary Workflow)
+
+This project is packaged with `pyproject.toml` and is intended to be run from a pip-installed environment.
+
+### 1) Create and activate a venv
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+Windows PowerShell:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+### 2) Install this repo in editable mode
+
+```bash
+pip install -e .
+```
+
+### 3) Install playwrong (CDP/browser backend)
+
+Use the vendored local package in this repo:
+
+```bash
+pip install -e ./playwrong
+```
+
+### 4) Optional extras
+
+```bash
+pip install -e ".[dev]"
+pip install -e ".[browser]"
+python -m playwright install chromium
+```
+
+Notes:
+
+- `.[dev]` is for tests/lint tooling.
+- `.[browser]` installs Playwright dependencies used by fallback paths.
+- Browser/CDP automation in this repo is routed through `playwrong`.
+- There is intentionally no `requirements.txt` in this repo.
+
+## Domain Inventory Scope (No Subdomain Scanner Included)
+
+This repo does **not** include an automated Avature subdomain enumeration crawler/scanner.
+
+What is included:
+
+- `sample.csv` as a small starter list of Avature business hosts
+- support for your own larger CSV (for batch runs, `parallelize.py` prefers `avature_subdomains.csv` when present)
+
+What is not included:
+
+- brute-force/passive DNS subdomain discovery engine
+- hosted-tenant universe maintenance
+
+For discovery inside a known host (not host enumeration), see:
+
+- `parallelize.py --discover-only` (collects discovered job URLs from landing pages)
+- `src/avature_ethics_scraper/fetchers.py` (landing/menu traversal and discovery probing)
+- `src/avature_ethics_scraper/extract.py` (`extract_listing_discovery_signals`, pagination/job URL signal extraction)
+
+For maintaining a broad Avature host inventory, use external data sources/services and feed results into CSV input for this repo. Common options include passive DNS / domain intelligence providers such as [WhoisXML API](https://whoisxmlapi.com/), certificate transparency tooling, and internal enterprise domain inventories.
 
 ## Features
 
@@ -13,32 +89,23 @@ Ethical, **robots.txt-first** CLI for Avature-hosted career sites. It is meant a
 | **Field gates** | When optional columns are requested, missing values on an early tier force escalation to the next fetch method (same UX as non-job HTML). After headful, a best-effort inference pass may fill gaps and sets `needs_manual_review` on the row. |
 | **CSV + JobPool** | By default, writes a JobPool-shaped CSV next to `--output` (`<stem>.csv`) when there is at least one job, and **POST**s listings to [jobpool.live](https://jobpool.live/) scrape-cache. Disable the POST with `--no-upload-to-jobpool`. |
 
-## Install
-
-From the repo (editable):
+## Install (Quick)
 
 ```bash
-cd avature_scraper_src
-pip install -e ".[dev]"
-```
-
-For Playwright fallbacks:
-
-```bash
-pip install -e ".[browser]"
-python -m playwright install chromium
+pip install -e .
+pip install -e ./playwrong
 ```
 
 ## Basic run
 
 ```bash
-aventure-scraper https://company.avature.net/careers --output jobs.json
+avature-scraper https://company.avature.net/careers --output jobs.json
 ```
 
 Pin explicit job detail URLs (repeatable):
 
 ```bash
-aventure-scraper https://company.avature.net/careers \
+avature-scraper https://company.avature.net/careers \
   --job-url "https://company.avature.net/careers/JobDetail/Example-Role/12345" \
   --output jobs.json
 ```
@@ -70,7 +137,7 @@ These turn on **extraction + completion checks** for the matching columns (missi
 `--all` is shorthand for enabling **all** of the flags above **and** expanding `output_fields` to the full JobDataPool-style column set defined in code (`JOBDATAPOOL_OUTPUT_FIELDS` in `models.py`), suitable for CSV export toward [jobdatapool.com](https://jobdatapool.com/) / JobPool pipelines.
 
 ```bash
-aventure-scraper https://company.avature.net/careers --all --output jobs.json
+avature-scraper https://company.avature.net/careers --all --output jobs.json
 ```
 
 ## CSV export and JobPool upload
@@ -82,13 +149,13 @@ The CSV uses headers compatible with the public scrape cache (`REQUIRED_FIELDS` 
 **Skip only the network upload** (still write the default CSV when there are jobs):
 
 ```bash
-aventure-scraper https://company.avature.net/careers --output jobs.json --no-upload-to-jobpool
+avature-scraper https://company.avature.net/careers --output jobs.json --no-upload-to-jobpool
 ```
 
 **Custom CSV path** (upload still on unless you add `--no-upload-to-jobpool`):
 
 ```bash
-aventure-scraper https://company.avature.net/careers --output jobs.json --csv-out ./out/listings.csv
+avature-scraper https://company.avature.net/careers --output jobs.json --csv-out ./out/listings.csv
 ```
 
 ### Environment variables
@@ -96,13 +163,13 @@ aventure-scraper https://company.avature.net/careers --output jobs.json --csv-ou
 | Variable | Purpose |
 |----------|---------|
 | `JOBPOOL_SCRAPE_CACHE_URL` | Override API URL (default `https://jobpool.live/api/scrape-cache`). |
-| `LIVEJOBPOOL_ROOT` | Absolute path to your [livejobpool](https://github.com/) clone. When set, each upload payload is **also** appended as one JSON line to `{LIVEJOBPOOL_ROOT}/.aventure-scraper-cache/<user>.jsonl` for a local audit trail keyed by the resolved user name. |
+| `LIVEJOBPOOL_ROOT` | Absolute path to your [livejobpool](https://github.com/) clone. When set, each upload payload is **also** appended as one JSON line to `{LIVEJOBPOOL_ROOT}/.avature-scraper-cache/<user>.jsonl` for a local audit trail keyed by the resolved user name. |
 
 Example (Windows PowerShell):
 
 ```powershell
 $env:LIVEJOBPOOL_ROOT = "C:\Users\you\Projects\livejobpool"
-aventure-scraper https://company.avature.net/careers --output jobs.json
+avature-scraper https://company.avature.net/careers --output jobs.json
 ```
 
 ### Who is `user_name` on the wire?

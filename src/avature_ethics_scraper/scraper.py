@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from .console import (
     console,
@@ -20,6 +21,7 @@ from .console import (
 from .extract import (
     apply_headful_inference,
     discover_job_urls,
+    extract_listing_discovery_signals,
     extract_job_record,
     is_linkedin_hosted_careers_landing,
     validate_job_page,
@@ -50,6 +52,9 @@ class ScrapeSettings:
     angry: bool = False
     browser_path: str | None = None
     browser_engine: str = "chromium"
+    prefer_open_browser: bool = False
+    cdp_endpoint: str | None = None
+    cdp_probe_timeout_seconds: float = 5.0
     allow_disallowed_robots: bool = False
     # If True, never skip headful Playwright for job URLs after plain HTTP succeeds once (default: skip for speed).
     headful_for_each_job: bool = False
@@ -72,6 +77,9 @@ class EthicalAvatureScraper:
             verbose=settings.verbose,
             browser_path=settings.browser_path,
             browser_engine=settings.browser_engine,
+            prefer_open_browser=settings.prefer_open_browser,
+            cdp_endpoint=settings.cdp_endpoint,
+            cdp_probe_timeout_seconds=settings.cdp_probe_timeout_seconds,
         )
         self.requests_fetcher = RequestsFetcher(fetch_settings)
         self.playwright_headless = PlaywrightFetcher(fetch_settings, headless=True)
@@ -132,6 +140,13 @@ class EthicalAvatureScraper:
             landing.content,
             target_url,
             same_host_only=self.settings.same_host_only,
+        )
+        discovered_urls = self._discover_paginated_listing_job_urls(
+            target_url,
+            landing.content,
+            report=report,
+            cache=cache,
+            initial_urls=discovered_urls,
         )
         report.discovered_job_urls = _dedupe_preserve_order(
             [*supplied_urls, *report.discovered_job_urls, *discovered_urls]
@@ -261,7 +276,16 @@ class EthicalAvatureScraper:
                 ("headless Playwright", self.playwright_headless.fetch, "headless Playwright"),
             ])
         start_index = 0
-        if require_job_page and not self.settings.headful_for_each_job:
+        # After the first job succeeds via plain HTTP, we normally skip headful for speed — but that
+        # also skips CDP/Edge entirely. If the operator asked for CDP or prefer-open, always start at
+        # headful (tier 0) for every job-detail URL so the browser stays in the loop.
+        allow_http_fast_path_for_jobs = (
+            require_job_page
+            and not self.settings.headful_for_each_job
+            and not (self.settings.cdp_endpoint or "").strip()
+            and not self.settings.prefer_open_browser
+        )
+        if allow_http_fast_path_for_jobs:
             start_index = min(self._job_detail_fetch_start_index, len(attempts) - 1)
 
         last_result: FetchResult | None = None
@@ -376,6 +400,80 @@ class EthicalAvatureScraper:
         if not require_job_page:
             return
         self._job_detail_fetch_start_index = max(self._job_detail_fetch_start_index, tier_index)
+
+    def _discover_paginated_listing_job_urls(
+        self,
+        base_url: str,
+        landing_html: str,
+        *,
+        report: ScrapeReport,
+        cache: ReportCache | None,
+        initial_urls: list[str],
+    ) -> list[str]:
+        signals = extract_listing_discovery_signals(
+            landing_html,
+            base_url,
+            same_host_only=self.settings.same_host_only,
+        )
+        legend = signals.pagination_legend
+        if legend is None:
+            return initial_urls
+        hints_lower = {h.lower() for h in signals.query_param_hints}
+        if "joboffset" not in hints_lower:
+            return initial_urls
+
+        parsed = urlparse(base_url)
+        params = parse_qs(parsed.query or "")
+        try:
+            current_offset = int((params.get("jobOffset") or params.get("joboffset") or ["0"])[0])
+        except (TypeError, ValueError):
+            current_offset = 0
+        page_size = max(1, int(legend.page_size))
+        known_total = int(legend.total_results)
+        discovered = _dedupe_preserve_order(initial_urls)
+        max_pages = 20
+        empty_pages = 0
+        max_empty_pages = 2
+
+        for _ in range(max_pages):
+            next_offset = current_offset + page_size
+            if next_offset >= known_total:
+                break
+            if len(discovered) >= self.settings.max_jobs:
+                break
+            query = parse_qs(parsed.query or "")
+            query["jobOffset"] = [str(next_offset)]
+            if "jobrecordsperpage" in hints_lower and "jobRecordsPerPage" not in query:
+                query["jobRecordsPerPage"] = [str(page_size)]
+            page_url = urlunparse(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    "",
+                    urlencode([(k, v) for k, vals in query.items() for v in vals]),
+                    "",
+                )
+            )
+            result, _job_unused = self._guarded_progressive_fetch(page_url, report=report, require_job_page=False)
+            if not result or not result.ok or not result.content:
+                break
+            extra = discover_job_urls(
+                result.content,
+                page_url,
+                same_host_only=self.settings.same_host_only,
+            )
+            before = len(discovered)
+            discovered = _dedupe_preserve_order([*discovered, *extra])
+            if len(discovered) == before:
+                empty_pages += 1
+            else:
+                empty_pages = 0
+            if empty_pages >= max_empty_pages:
+                break
+            current_offset = next_offset
+            self._write_incremental(cache, report)
+        return discovered
 
 
 def _dedupe_preserve_order(values: list[str]) -> list[str]:

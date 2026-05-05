@@ -125,7 +125,7 @@ def append_local_jobpool_mirror(payload: dict[str, Any]) -> Path | None:
         return None
     user = str(payload.get("user_name") or "unknown").strip() or "unknown"
     safe = re_slug_filename(user)
-    cache_dir = Path(root).expanduser() / ".aventure-scraper-cache"
+    cache_dir = Path(root).expanduser() / ".avature-scraper-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / f"{safe}.jsonl"
     line = json.dumps(payload, ensure_ascii=False) + "\n"
@@ -147,7 +147,7 @@ def post_jobpool_scrape_cache(payload: dict[str, Any], *, timeout: float = 60.0)
             json=payload,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "aventure-scraper/0.2.4 (+https://jobpool.live)",
+                "User-Agent": "avature-scraper/0.2.4 (+https://jobpool.live)",
             },
             timeout=timeout,
         )

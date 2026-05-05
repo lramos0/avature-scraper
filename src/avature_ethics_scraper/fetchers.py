@@ -1,4 +1,8 @@
-"""Progressive fetchers: requests, Playwright headless, then Playwright headful."""
+"""Progressive fetchers: requests, then playwrong browser tiers (headless/headful/CDP).
+
+Headful/headless/CDP automation uses the **playwrong** package (this repo's ``playwrong/`` tree —
+CDP over WebSocket, API names mirror Playwright for familiarity). It is **not** ``pip install playwright``.
+"""
 
 from __future__ import annotations
 
@@ -102,6 +106,11 @@ class FetchSettings:
     verbose: bool = False
     browser_path: str | None = None
     browser_engine: str = "chromium"
+    prefer_open_browser: bool = False
+    # Same as YP extract_from_all_pages: explicit CDP URL, e.g. http://127.0.0.1:9222
+    cdp_endpoint: str | None = None
+    # playwrong defaults to a very short socket probe; raise this so Edge on 9222 is detected.
+    cdp_probe_timeout_seconds: float = 5.0
 
     @property
     def extended_timeout_seconds(self) -> float:
@@ -131,6 +140,9 @@ class RequestsFetcher:
                 headers={
                     "User-Agent": self._settings.user_agent,
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
                 },
             )
         except requests.RequestException as exc:
@@ -211,6 +223,8 @@ class RequestsFetcher:
 
 
 class PlaywrightFetcher:
+    """Browser fetcher backed by **playwrong** (``playwrong.sync_api.sync_playwright`` context manager)."""
+
     def __init__(self, settings: FetchSettings, *, headless: bool) -> None:
         self._settings = settings
         self._headless = headless
@@ -218,13 +232,13 @@ class PlaywrightFetcher:
     def fetch(self, url: str, *, require_job_page: bool = False) -> FetchResult:
         method = FetchMethod.PLAYWRIGHT_HEADLESS if self._headless else FetchMethod.PLAYWRIGHT_HEADFUL
         try:
-            from playwrong.sync_api import sync_playwright
+            from playwrong.sync_api import sync_playwright as playwrong_session
         except ImportError:
             return FetchResult(
                 url=url,
                 method=method,
                 ok=False,
-                error="playwrong is not installed. Install with: pip install -e c:\\Users\\logan\\Projects\\yp_service_processor\\playwrong",
+                error="playwrong is not installed. From the repo root: pip install -e ./playwrong",
             )
 
         if not self._headless:
@@ -245,12 +259,22 @@ class PlaywrightFetcher:
         content = ""
         status_code: int | None = None
         try:
-            # prefer_open=False avoids noisy "attach to open browser" attempts (Firefox cannot attach via CDP).
-            with sync_playwright(verbose=self._settings.verbose, prefer_open=False) as playwright:
-                launch_kwargs: dict[str, Any] = {"headless": self._headless, "prefer_open": False}
+            # prefer_open=True reuses an already-open debug Chromium/Edge when playwrong can reach the port.
+            prefer_open = bool(self._settings.prefer_open_browser)
+            cdp_url = (self._settings.cdp_endpoint or "").strip() or None
+            probe_s = float(self._settings.cdp_probe_timeout_seconds)
+            with playwrong_session(
+                verbose=self._settings.verbose,
+                prefer_open=prefer_open,
+                cdp_timeout_seconds=probe_s,
+                cdp_endpoints=[cdp_url] if cdp_url else None,
+            ) as pw:
+                launch_kwargs: dict[str, Any] = {"headless": self._headless, "prefer_open": prefer_open}
                 engine = (self._settings.browser_engine or "chromium").strip().lower()
-                if engine not in {"chromium", "firefox"}:
-                    self._vlog("playwright", f"unsupported browser engine '{engine}', falling back to chromium")
+                if engine == "edge":
+                    engine = "chromium"
+                elif engine not in {"chromium", "firefox"}:
+                    self._vlog("playwrong", f"unsupported browser engine '{engine}', falling back to chromium")
                     engine = "chromium"
                 if engine == "firefox":
                     gecko_err = _ensure_geckodriver_available()
@@ -261,20 +285,29 @@ class PlaywrightFetcher:
                     browser_path = _resolve_firefox_browser_path_for_linux(browser_path)
                 if browser_path:
                     launch_kwargs["browser_path"] = browser_path
-                self._vlog("playwright", f"launch {engine} headless={self._headless} browser_path={browser_path}")
+                self._vlog(
+                    "playwrong",
+                    f"launch {engine} headless={self._headless} browser_path={browser_path} "
+                    f"prefer_open={prefer_open} cdp_endpoint={cdp_url!r}",
+                )
                 browser = None
                 try:
                     if engine == "firefox":
-                        browser = self._launch_with_timeout(playwright.firefox.launch, launch_kwargs)
+                        browser = self._launch_with_timeout(pw.firefox.launch, launch_kwargs)
+                    elif cdp_url:
+                        # playwrong: explicit CDP HTTP endpoint (Edge/Chrome --remote-debugging-port).
+                        browser = pw.chromium.connect_over_cdp(cdp_url, checkpoint_human=False)
+                        self._vlog("playwrong", f"connect_over_cdp {cdp_url!r}")
                     else:
-                        browser = self._launch_with_timeout(playwright.chromium.launch, launch_kwargs)
+                        browser = self._launch_with_timeout(pw.chromium.launch, launch_kwargs)
                     context = browser.new_context(user_agent=self._settings.user_agent)
                     page = context.new_page()
 
                     try:
+                        wait_until = "domcontentloaded" if require_job_page else "load"
                         response = page.goto(
                             url,
-                            wait_until="domcontentloaded",
+                            wait_until=wait_until,
                             timeout=int(self._settings.initial_read_timeout_seconds * 1000),
                         )
                         status_code = response.status if response else None
@@ -282,6 +315,9 @@ class PlaywrightFetcher:
                         pass
 
                     if not require_job_page:
+                        # Give SPA hydration a moment before we start scrolling/probing.
+                        # Some Avature variants populate listings slightly after domcontentloaded.
+                        self._wait_for_timeout(page, 1500)
                         self._auto_scroll_for_listings(page)
                     content = page.content()
                     if not require_job_page:
@@ -307,12 +343,12 @@ class PlaywrightFetcher:
                             content = page.content()
                 finally:
                     if browser is not None:
-                        self._vlog("playwright", "closing browser session")
+                        self._vlog("playwrong", "closing browser session")
                         try:
                             browser.close()
                         except Exception:
                             pass
-        except Exception as exc:  # Playwright raises several runtime-specific exception classes.
+        except Exception as exc:  # playwrong/CDP raises PlaywrongError and network errors.
             return FetchResult(
                 url=url,
                 method=method,
@@ -366,7 +402,7 @@ class PlaywrightFetcher:
     def _auto_scroll_for_listings(self, page) -> None:
         """Scroll until listing cards appear, or until bottom is reached."""
         try:
-            self._vlog("playwright", "auto-scroll start (landing page)")
+            self._vlog("playwrong", "auto-scroll start (landing page)")
             max_passes = 40
             for idx in range(max_passes):
                 if self._page_has_epic_job_listing_cards(page):
@@ -475,11 +511,18 @@ class PlaywrightFetcher:
                     or after["containerTop"] <= before["containerTop"]
                 )
                 no_progress = no_page_progress and no_container_progress
-                if (at_or_near_bottom and container_at_bottom) or no_progress:
+                # If we couldn't detect any scrollable container (containerTop is None),
+                # "no_progress" is ambiguous and can prematurely stop hydration on sites
+                # that render listings after JS timers or in a container our heuristic
+                # doesn't recognize.
+                should_stop = (at_or_near_bottom and container_at_bottom) or (
+                    no_progress and after["containerTop"] is not None
+                )
+                if should_stop:
                     self._vlog(
                         "scroll",
                         f"stop condition met (bottom={at_or_near_bottom and container_at_bottom}, "
-                        f"no_progress={no_progress})",
+                        f"no_progress={no_progress}, containerTop={after['containerTop']})",
                     )
                     break
             if not self._page_has_epic_job_listing_cards(page):
@@ -504,9 +547,9 @@ class PlaywrightFetcher:
                 }
                 """
             )
-            self._vlog("playwright", "auto-scroll done; viewport reset to top")
+            self._vlog("playwrong", "auto-scroll done; viewport reset to top")
         except Exception:
-            self._vlog("playwright", "auto-scroll failed with exception")
+            self._vlog("playwrong", "auto-scroll failed with exception")
             return
 
     def _expand_jobs_menu_and_collect_pages(self, page, _base_url: str, initial_content: str) -> str:
@@ -519,11 +562,15 @@ class PlaywrightFetcher:
         combined_sections: list[str] = [initial_content]
         visited: set[str] = set()
         original_url = self._page_url(page)
+        # Some sites render the submenu markup even if hover/click fails.
+        # If hover fails, still attempt to extract submenu links from the DOM.
         if self._hover_jobs_menu(page):
             self._vlog("discovery", "hovered Jobs menuitem successfully")
         else:
-            self._vlog("discovery", "failed to hover Jobs menuitem; using landing content only")
-            return initial_content
+            self._vlog(
+                "discovery",
+                "failed to hover Jobs menuitem; attempting submenu link extraction anyway",
+            )
 
         resolved_urls = self._jobs_submenu_urls(page)
         if not resolved_urls:
@@ -538,7 +585,7 @@ class PlaywrightFetcher:
             try:
                 response = page.goto(
                     target_url,
-                    wait_until="domcontentloaded",
+                    wait_until="load",
                     timeout=int(self._settings.timeout_seconds * 1000),
                 )
                 if response is not None and response.status >= 400:
@@ -564,7 +611,7 @@ class PlaywrightFetcher:
 
         if original_url and self._page_url(page) != original_url:
             try:
-                page.goto(original_url, wait_until="domcontentloaded", timeout=int(self._settings.timeout_seconds * 1000))
+                page.goto(original_url, wait_until="load", timeout=int(self._settings.timeout_seconds * 1000))
             except Exception:
                 pass
         self._vlog("discovery", f"combined discovery documents: {len(combined_sections)}")
@@ -605,7 +652,7 @@ class PlaywrightFetcher:
             try:
                 response = page.goto(
                     apply_url,
-                    wait_until="domcontentloaded",
+                    wait_until="load",
                     timeout=int(self._settings.timeout_seconds * 1000),
                 )
                 if response is not None and response.status >= 400:
@@ -622,7 +669,7 @@ class PlaywrightFetcher:
                 try:
                     page.goto(
                         current_category_url,
-                        wait_until="domcontentloaded",
+                        wait_until="load",
                         timeout=int(self._settings.timeout_seconds * 1000),
                     )
                 except Exception:
@@ -724,7 +771,7 @@ class PlaywrightFetcher:
     def _vlog(self, scope: str, message: str) -> None:
         if not self._settings.verbose:
             return
-        console.print(f"[dim][playwright:{scope}] {message}[/]")
+        console.print(f"[dim][playwrong:{scope}] {message}[/]")
 
 
 def _has_epic_job_listing_cards(content: str) -> bool:

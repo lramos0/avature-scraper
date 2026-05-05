@@ -1,4 +1,4 @@
-"""Command-line interface for aventure-scraper."""
+"""Command-line interface for avature-scraper."""
 
 from __future__ import annotations
 
@@ -30,7 +30,14 @@ app = typer.Typer(
     help="Ethical Avature career-site scraper with robots.txt checks, output caching, and progressive fetch fallbacks.",
 )
 
-DEFAULT_USER_AGENT = "aventure-scraper/0.2.4 (+https://example.com/contact)"
+DEFAULT_USER_AGENT = "avature-scraper/0.2.4 (+https://example.com/contact)"
+
+
+def _cache_action_override() -> str | None:
+    raw = (os.environ.get("AVATURE_CACHE_ACTION") or "").strip().lower()
+    if raw in {"continue", "overwrite"}:
+        return raw
+    return None
 
 
 @app.command()
@@ -43,7 +50,7 @@ def main(
     output: Annotated[
         Path,
         typer.Option("--output", "-o", help="JSON report output path. Existing files are used as the seen-job cache."),
-    ] = Path("aventure_jobs.json"),
+    ] = Path("avature_jobs.json"),
     user_agent: Annotated[
         str,
         typer.Option("--user-agent", help="User-Agent used for robots.txt and fetch requests."),
@@ -87,6 +94,26 @@ def main(
             case_sensitive=False,
         ),
     ] = "chromium",
+    prefer_open_browser: Annotated[
+        bool,
+        typer.Option(
+            "--prefer-open-browser",
+            help=(
+                "Prefer attaching to an already-open debug browser session (Chromium only) "
+                "before launching a new one."
+            ),
+        ),
+    ] = False,
+    cdp_endpoint: Annotated[
+        str | None,
+        typer.Option(
+            "--cdp-endpoint",
+            help=(
+                "Attach to this CDP HTTP endpoint (YP-style), e.g. http://127.0.0.1:9222. "
+                "Start Edge with --remote-debugging-port=9222 first."
+            ),
+        ),
+    ] = None,
     angry: Annotated[
         bool,
         typer.Option("--angry", help="Easter egg: red cat; also bypasses robots disallow without prompting (legacy)."),
@@ -200,6 +227,7 @@ def main(
 
     cache = ReportCache(output)
     cached_report = None
+    cache_action_override = _cache_action_override()
     if cache.exists:
         try:
             loaded = cache.load()
@@ -207,7 +235,7 @@ def main(
                 cache_report = loaded
                 show_cache_loaded(str(output), len(loaded.jobs))
             else:
-                action = choose_existing_output_action(str(output), len(loaded.jobs))
+                action = cache_action_override or choose_existing_output_action(str(output), len(loaded.jobs))
                 if action == "continue":
                     cached_report = loaded
                     show_cache_loaded(str(output), len(loaded.jobs))
@@ -215,7 +243,7 @@ def main(
                     show_cache_overwrite(str(output))
         except ReportCacheError as exc:
             console.print(f"[yellow]![/] {exc}")
-            action = choose_existing_output_action(str(output), 0)
+            action = cache_action_override or choose_existing_output_action(str(output), 0)
             if action == "continue":
                 raise typer.Exit(code=2)
             show_cache_overwrite(str(output))
@@ -240,6 +268,8 @@ def main(
         angry=angry,
         browser_path=browser_path,
         browser_engine=browser_engine.strip().lower(),
+        prefer_open_browser=prefer_open_browser,
+        cdp_endpoint=(cdp_endpoint or "").strip() or None,
         allow_disallowed_robots=allow_disallowed_robots,
         headful_for_each_job=headful_for_each_job,
         discover_only=discover_only,

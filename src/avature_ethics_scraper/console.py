@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import os
 import time
 from collections.abc import Callable
 from typing import TypeVar
@@ -30,7 +31,7 @@ T = TypeVar("T")
 
 
 def banner() -> None:
-    title = Text("aventure-scraper", style="bold bright_cyan")
+    title = Text("avature-scraper", style="bold bright_cyan")
     subtitle = Text("robots.txt-first • polite • cached • progressive fetch", style="bright_white")
     console.print(Panel.fit(Text.assemble(title, "\n", subtitle), border_style="bright_blue", padding=(1, 4)))
 
@@ -174,8 +175,22 @@ def explain_next_fetch(next_method: str) -> None:
             border_style="yellow",
         )
     )
+    non_interactive = bool(os.environ.get("AVATURE_NON_INTERACTIVE"))
+    if non_interactive:
+        console.print(
+            "[dim]Batch/non-interactive mode: continuing automatically to the next fetch method.[/]"
+        )
+        return
+
     if sys.stdin.isatty():
-        input()
+        try:
+            input()
+        except (EOFError, KeyboardInterrupt):
+            # When stdin is a closed pipe (common under process supervision / redirected input),
+            # rich still renders the prompt but there is no Enter available; treat it as "continue".
+            console.print(
+                "[dim]No usable stdin (EOF/interrupt): continuing to the next fetch method.[/]"
+            )
     else:
         console.print(
             "[dim]Non-interactive stdin: continuing automatically to the next fetch method.[/]"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import json
 from pathlib import Path
 from typing import Iterable
@@ -117,6 +118,8 @@ def _clean_cached_job(job: JobSummary) -> JobSummary:
     )
 
 def _strip_raw_fetch_content(report: ScrapeReport) -> ScrapeReport:
+    if os.environ.get("AVATURE_DEBUG_KEEP_CONTENT"):
+        return report
     stripped = report.model_copy(deep=True)
     if stripped.landing_page is not None:
         stripped.landing_page = stripped.landing_page.model_copy(update={"content": ""})

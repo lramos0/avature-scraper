@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import os
+
 from .models import JobSummary
 from .urls import stable_id_from_url
 
@@ -74,6 +76,9 @@ def _default_description(job: JobSummary) -> str | None:
 
 
 def missing_default_fields(job: JobSummary) -> list[str]:
+    # Many Avature variants omit a visible "location" string while still having a valid job posting.
+    # For batch scraping, allow operator to relax this gate.
+    relax_location = bool(os.environ.get("AVATURE_RELAX_LOCATION"))
     missing: list[str] = []
     sid = _stable_id(job)
     if not sid:
@@ -83,8 +88,9 @@ def missing_default_fields(job: JobSummary) -> list[str]:
     desc = _default_description(job)
     if not desc or len(desc) < MIN_DEFAULT_DESCRIPTION_LEN:
         missing.append("description")
-    if not (job.location or "").strip():
-        missing.append("location")
+    if not relax_location:
+        if not (job.location or "").strip():
+            missing.append("location")
     if not (job.url or "").strip():
         missing.append("url")
     return missing
@@ -119,7 +125,10 @@ def missing_optional_page_fields(job: JobSummary, spec: OutputSpec) -> list[str]
 
 
 def missing_required_fields(job: JobSummary, spec: OutputSpec) -> list[str]:
-    return [*missing_default_fields(job), *missing_optional_page_fields(job, spec)]
+    _ = spec
+    # "Required" means the core row shape only. Optional/all-jobdatapool fields are
+    # best-effort and should not cause row rejection.
+    return missing_default_fields(job)
 
 
 def apply_runtime_ingestion_fields(job: JobSummary) -> JobSummary:

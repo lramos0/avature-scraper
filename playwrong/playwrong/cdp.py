@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import URLError
 from urllib.parse import quote, urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from websocket import WebSocket, WebSocketTimeoutException, create_connection
 
@@ -195,7 +195,11 @@ class CDPSession:
 
 def create_page_target(base_url: str, initial_url: str = "about:blank") -> dict[str, Any]:
     encoded = quote(initial_url, safe=":/?&=%#")
-    with urlopen(f"{base_url}/json/new?{encoded}", timeout=5.0) as response:  # noqa: S310
+    # Edge's remote debugging endpoint expects PUT /json/new and uses a query param `url=...`.
+    # If we use GET or omit the `url=` key, Edge returns HTTP 405 Method Not Allowed.
+    target_url = f"{base_url}/json/new?url={encoded}"
+    req = Request(target_url, method="PUT")
+    with urlopen(req, timeout=5.0) as response:  # noqa: S310
         payload = response.read().decode("utf-8", errors="replace")
     parsed = json.loads(payload)
     if not isinstance(parsed, dict):
