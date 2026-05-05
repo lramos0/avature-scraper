@@ -168,7 +168,7 @@ When user reports "no jobs", "edge idle", or "stuck":
 Single domain smoke test with CDP:
 
 ```powershell
-.\scripts\run_parallel.ps1 --workers 1 --domain xerox.avature.net --browser-engine chromium --cdp-endpoint "http://127.0.0.1:9222" --delay 0 --max-jobs 5 --verbose
+.\scripts\run_parallel.ps1 --workers 1 --domain bloomberg.avature.net --browser-engine chromium --cdp-endpoint "http://127.0.0.1:9222" --delay 0 --max-jobs 5 --verbose
 ```
 
 Two-worker batch with two Edge instances:
