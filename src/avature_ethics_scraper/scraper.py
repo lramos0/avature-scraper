@@ -126,7 +126,8 @@ class EthicalAvatureScraper:
 
                 show_job_progress(index, total_jobs, job_url, verbose=self.settings.verbose)
                 cat_progress.update(index - 1)
-                polite_delay(self.settings.delay_seconds)
+                if not self.settings.angry:
+                    polite_delay(self.settings.delay_seconds)
                 result, job = self._guarded_progressive_fetch(
                     job_url,
                     report=report,
@@ -193,7 +194,7 @@ class EthicalAvatureScraper:
         report.robots.append(decision)
         show_robots(decision, verbose=self.settings.verbose)
 
-        if not decision.allowed:
+        if not decision.allowed and not self.settings.angry:
             if not require_legal_acknowledgement():
                 console.print("[bold green]Stopped safely. No request was made to the disallowed URL.[/]")
                 report.warnings.append(f"Stopped before fetching disallowed URL: {url}")
@@ -201,13 +202,15 @@ class EthicalAvatureScraper:
             report.warnings.append(
                 f"Operator explicitly acknowledged legal responsibility before fetching disallowed URL: {url}"
             )
-
+        
         attempts = [
-            ("Requests GET", self.requests_fetcher.fetch, None),
-            ("headless Playwright", self.playwright_headless.fetch, "headless Playwright"),
             ("headful Playwright", self.playwright_headful.fetch, "headful Playwright"),
         ]
-
+        if not self.settings.angry:
+            attempts.extend([
+                ("Requests GET", self.requests_fetcher.fetch, None),
+                ("headless Playwright", self.playwright_headless.fetch, "headless Playwright"),
+            ])
         start_index = 0
         if require_job_page:
             start_index = min(self._job_detail_fetch_start_index, len(attempts) - 1)

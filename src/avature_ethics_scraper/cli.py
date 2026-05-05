@@ -137,12 +137,16 @@ def main(
     if cache.exists:
         try:
             loaded = cache.load()
-            action = choose_existing_output_action(str(output), len(loaded.jobs))
-            if action == "continue":
-                cached_report = loaded
+            if angry:
+                cache_report = loaded
                 show_cache_loaded(str(output), len(loaded.jobs))
             else:
-                show_cache_overwrite(str(output))
+                action = choose_existing_output_action(str(output), len(loaded.jobs))
+                if action == "continue":
+                    cached_report = loaded
+                    show_cache_loaded(str(output), len(loaded.jobs))
+                else:
+                    show_cache_overwrite(str(output))
         except ReportCacheError as exc:
             console.print(f"[yellow]![/] {exc}")
             action = choose_existing_output_action(str(output), 0)
